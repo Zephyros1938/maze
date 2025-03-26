@@ -202,7 +202,14 @@ impl std::fmt::Display for Maze {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         for row in &self.grid {
             for cell in row {
-                print!("{}", if cell == &1 { "  " } else { "##" });
+                print!("{}", {
+                    match cell {
+                        0 => "##",
+                        1 => "  ",
+                        2 => "[]",
+                        _ => "??",
+                    }
+                });
             }
             println!();
         }
