@@ -2,6 +2,7 @@ use std::{
     char,
     collections::HashMap,
     io::{Stdin, Stdout, Write, stdin, stdout},
+    ops::DerefMut,
 };
 use termion::{
     event::Key,
@@ -55,7 +56,11 @@ impl Terminal {
         }
     }
 
-    // Screen
+    // Visual
+
+    pub fn write(mut self, t: String) {
+        write!(self.stdout, "{}", t).unwrap();
+    }
 
     // Key Actions
 
@@ -78,13 +83,12 @@ impl Terminal {
 }
 
 pub struct Screen {
-    base: Terminal,
-    pixel_buffer: Vec<Vec<char>>,
+    pixel_buffer: Vec<Vec<String>>,
     dimensions: (usize, usize),
 }
 
 impl Screen {
-    pub fn new(terminal: Terminal, dimensions: (usize, usize)) -> Self {
+    pub fn new(dimensions: (usize, usize)) -> Self {
         let cols = std::env::var("COLUMNS")
             .unwrap_or(String::from("80"))
             .parse::<usize>()
@@ -102,9 +106,17 @@ impl Screen {
         }
 
         Self {
-            base: terminal,
-            pixel_buffer: vec![vec![' '; dimensions.0]; dimensions.1],
+            pixel_buffer: vec![vec![String::from("__"); dimensions.0]; dimensions.1],
             dimensions,
+        }
+    }
+
+    pub fn print(self) {
+        for y in &self.pixel_buffer {
+            for x in y {
+                print!("{}", x);
+            }
+            print!("{}", String::from("\r\n"));
         }
     }
 }
