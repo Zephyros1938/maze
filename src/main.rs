@@ -1,5 +1,5 @@
-use std::{collections::HashMap, process};
-use terminal::Screen;
+use std::{collections::HashMap, process, sync::Arc};
+use terminal::{TerminalScreen, TerminalScreenTrait, TerminalTrait};
 use termion::event::Key;
 
 mod maze;
@@ -7,23 +7,19 @@ mod moveset;
 mod terminal;
 
 fn main() {
-    let mut term = terminal::Terminal::new(String::from("Press Esc to exit"));
-    let mut screen = terminal::Screen::new((20, 20));
-    let mut key_actions: HashMap<Key, Box<dyn FnMut() + Send + 'static>> = HashMap::new();
+    let mut screen = terminal::TerminalScreen::new(String::from("Press Esc to exit"), (0, 0));
+    let mut key_actions: HashMap<Key, Arc<dyn Fn()>> = HashMap::new();
+    let mut run_actions: HashMap<(bool, u8), Arc<dyn Fn()>> = HashMap::new();
     key_actions.insert(
         Key::Esc,
-        Box::new(|| {
+        Arc::new(|| {
             println!("Exit");
             process::exit(0);
         }),
     );
-    key_actions.insert(
-        Key::Char('w'),
-        Box::new(|| {
-            screen.print();
-        }),
-    );
-    term.add_key_actions(key_actions);
 
-    term.run();
+    screen.add_key_actions(key_actions);
+    screen.add_run_actions(run_actions);
+
+    screen.run();
 }
