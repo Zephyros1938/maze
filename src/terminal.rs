@@ -4,7 +4,11 @@ use std::{
     fmt,
     io::{Stdin, Stdout, Write, stdin, stdout},
     ops::DerefMut,
-    sync::Arc,
+    process,
+    rc::Rc,
+    sync::{Arc, Mutex},
+    thread::{self, Thread},
+    time::Duration,
 };
 use termion::{
     event::Key,
@@ -130,7 +134,7 @@ impl TerminalTrait for Terminal {
     }
 }
 
-const SCREEN_BLANK_CHAR: char = '_';
+const SCREEN_BLANK_CHAR: char = ' ';
 const SCREEN_PIXEL_WIDTH: usize = 2;
 
 pub struct TerminalScreen {
@@ -140,8 +144,9 @@ pub struct TerminalScreen {
     pub startmessage: String,
     pub stdin: Stdin,
     pub stdout: RawTerminal<Stdout>,
-    key_actions: HashMap<Key, Arc<dyn Fn()>>,
-    run_actions: HashMap<(bool, u8), Arc<dyn Fn()>>,
+    key_actions: HashMap<Key, Arc<dyn Fn() + Send + Sync>>,
+    run_actions: HashMap<(bool, u8), Arc<dyn Fn() + Send + Sync>>,
+    queued_actions: Arc<Vec<Arc<dyn Fn() + Send + Sync + DerefMut>>>,
 }
 
 impl TerminalScreen {
@@ -158,14 +163,18 @@ impl TerminalScreen {
             );
         };
 
-        let pixel_buffer = if dimensions == (0, 0) {
-            vec![vec![String::from(SCREEN_BLANK_CHAR).repeat(SCREEN_PIXEL_WIDTH); cols]; rows]
+        let dimensions = if dimensions == (0, 0) {
+            (cols, rows)
         } else {
+            dimensions
+        };
+
+        let pixel_buffer =
             vec![
                 vec![String::from(SCREEN_BLANK_CHAR).repeat(SCREEN_PIXEL_WIDTH); dimensions.0];
                 dimensions.1
-            ]
-        };
+            ];
+
         Self {
             pixel_front_buffer: pixel_buffer.clone(),
             pixel_back_buffer: pixel_buffer,
@@ -175,6 +184,7 @@ impl TerminalScreen {
             stdout: stdout().into_raw_mode().unwrap(),
             key_actions: HashMap::new(),
             run_actions: HashMap::new(),
+            queued_actions: Arc::new(Vec::new()),
         }
     }
 
@@ -182,12 +192,16 @@ impl TerminalScreen {
         self.pixel_back_buffer[x][y] = String::from(c).repeat(SCREEN_PIXEL_WIDTH);
     }
 
-    pub fn draw(mut self) {
+    pub fn draw(&self) -> RawTerminal<Stdout> {
+        let mut stdout = stdout();
         for y in 0..self.dimensions.1 {
+            let yu16: u16 = y.try_into().unwrap();
             for x in 0..self.dimensions.0 {
-                write!(self.stdout, r#"{}{}"#, termion::cursor::Goto(x, y), x).unwrap();
+                let xu16: u16 = x.try_into().unwrap();
+                write!(stdout, r#"{}{}"#, termion::cursor::Goto(xu16, yu16), x).unwrap();
             }
         }
+        stdout.into_raw_mode().unwrap()
     }
 }
 
@@ -204,23 +218,23 @@ impl fmt::Display for TerminalScreen {
 }
 
 pub trait TerminalScreenTrait {
-    fn run(self);
+    unsafe fn run(self);
 
-    fn add_key_action(&mut self, k: char, func: Arc<dyn Fn()>);
-    fn add_key_actions(&mut self, h: HashMap<Key, Arc<dyn Fn()>>);
+    fn add_key_action(&mut self, k: char, func: Arc<dyn Fn() + Send + Sync>);
+    fn add_key_actions(&mut self, h: HashMap<Key, Arc<dyn Fn() + Send + Sync>>);
     fn rem_key_action(&mut self, k: char);
     fn rem_key_actions(&mut self, h: Vec<char>);
 
     // Run Actions
 
-    fn add_run_action(&mut self, enabled: bool, id: u8, func: Arc<dyn Fn()>);
-    fn add_run_actions(&mut self, h: HashMap<(bool, u8), Arc<dyn Fn()>>);
+    fn add_run_action(&mut self, enabled: bool, id: u8, func: Arc<dyn Fn() + Send + Sync>);
+    fn add_run_actions(&mut self, h: HashMap<(bool, u8), Arc<dyn Fn() + Send + Sync>>);
     fn rem_run_action(&mut self, id: u8);
     fn rem_run_actions(&mut self, h: Vec<char>);
 }
 
 impl TerminalScreenTrait for TerminalScreen {
-    fn run(mut self) {
+    unsafe fn run(mut self) {
         write!(
             self.stdout,
             r#"{}{}{}"#,
@@ -230,9 +244,28 @@ impl TerminalScreenTrait for TerminalScreen {
         )
         .unwrap();
         self.stdout.flush().unwrap();
+        let queued_actions = Arc::clone(&self.queued_actions);
+        thread::spawn(move || {
+            let key_actions = self.key_actions.clone();
+            let run_actions = self.run_actions.clone();
+            for c in self.stdin.keys() {
+                // i reckon this speaks for itself
+                if let Ok(key) = c {
+                    if let Some(action) = key_actions.get(&key) {
+                        (*queued_actions).push(action.clone());
+                    }
+                }
+
+                for (enabled, action) in run_actions.iter() {
+                    if enabled.0 == true {
+                        (*queued_actions).push(action.clone());
+                    };
+                }
+            }
+        });
 
         //detecting keydown events
-        for c in self.stdin.keys() {
+        loop {
             //clearing the screen and going to top left corner
             write!(
                 self.stdout,
@@ -242,29 +275,50 @@ impl TerminalScreenTrait for TerminalScreen {
             )
             .unwrap();
 
-            //i reckon this speaks for itself
-            if let Ok(key) = c {
-                if let Some(action) = self.key_actions.get(&key) {
-                    action()
-                }
-            }
-
-            for (enabled, action) in self.run_actions.iter() {
-                if enabled.0 == true {
-                    action()
-                };
+            for action in self.queued_actions.iter() {
+                action();
             }
 
             self.pixel_front_buffer = self.pixel_back_buffer.clone();
+            //write!(self.stdout, "{}x{}", self.dimensions.0, self.dimensions.1).unwrap();
+            for y in 0..self.dimensions.1 {
+                let yu16: u16 = (y + 1).try_into().unwrap();
+                for x in 0..self.dimensions.0 {
+                    let xu16: u16 = ((x + 1) * SCREEN_PIXEL_WIDTH).try_into().unwrap();
+                    write!(
+                        self.stdout,
+                        "{}{}",
+                        self.pixel_front_buffer[y][x],
+                        termion::cursor::Goto(xu16, yu16)
+                    )
+                    .unwrap();
+                }
+            }
+
+            for y in 0..self.dimensions.1 {
+                for x in 0..self.dimensions.0 {
+                    self.pixel_back_buffer[y][x] = String::from(
+                        if self.pixel_back_buffer[y][x]
+                            == String::from(SCREEN_BLANK_CHAR).repeat(SCREEN_PIXEL_WIDTH)
+                        {
+                            String::from('#')
+                        } else {
+                            String::from(SCREEN_BLANK_CHAR)
+                        },
+                    )
+                    .repeat(SCREEN_PIXEL_WIDTH);
+                }
+            }
 
             self.stdout.flush().unwrap();
+            thread::sleep(Duration::from_secs_f32(1.0 / 60.0));
         }
     }
 
-    fn add_key_action(&mut self, k: char, func: Arc<dyn Fn()>) {
+    fn add_key_action(&mut self, k: char, func: Arc<dyn Fn() + Send + Sync>) {
         self.key_actions.insert(Key::Char(k), func);
     }
-    fn add_key_actions(&mut self, h: HashMap<Key, Arc<dyn Fn()>>) {
+    fn add_key_actions(&mut self, h: HashMap<Key, Arc<dyn Fn() + Send + Sync>>) {
         for k in h {
             self.key_actions.insert(k.0, k.1);
         }
@@ -280,10 +334,10 @@ impl TerminalScreenTrait for TerminalScreen {
 
     // Run Actions
 
-    fn add_run_action(&mut self, enabled: bool, id: u8, func: Arc<dyn Fn()>) {
+    fn add_run_action(&mut self, enabled: bool, id: u8, func: Arc<dyn Fn() + Send + Sync>) {
         self.run_actions.insert((enabled, id), func);
     }
-    fn add_run_actions(&mut self, h: HashMap<(bool, u8), Arc<dyn Fn()>>) {
+    fn add_run_actions(&mut self, h: HashMap<(bool, u8), Arc<dyn Fn() + Send + Sync>>) {
         for k in h {
             self.run_actions.insert(k.0, k.1);
         }

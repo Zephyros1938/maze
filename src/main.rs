@@ -13,7 +13,7 @@ fn main() {
     key_actions.insert(
         Key::Esc,
         Arc::new(|| {
-            println!("Exit");
+            print!("\r\nExit");
             process::exit(0);
         }),
     );
