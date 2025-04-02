@@ -3,11 +3,8 @@ use std::{
     collections::HashMap,
     fmt,
     io::{Stdin, Stdout, Write, stdin, stdout},
-    ops::DerefMut,
-    process,
-    rc::Rc,
-    sync::{Arc, Mutex},
-    thread::{self, Thread},
+    sync::{Arc, mpsc::TryRecvError},
+    thread::{self},
     time::Duration,
 };
 use termion::{
@@ -15,6 +12,10 @@ use termion::{
     input::TermRead,
     raw::{IntoRawMode, RawTerminal},
 };
+
+const SCREEN_BLANK_CHAR: char = ' ';
+const SCREEN_PIXEL_WIDTH: usize = 2;
+const SCREEN_REFRESH_RATE: f32 = 15.0;
 
 pub struct Terminal {
     pub startmessage: String,
@@ -134,8 +135,11 @@ impl TerminalTrait for Terminal {
     }
 }
 
-const SCREEN_BLANK_CHAR: char = ' ';
-const SCREEN_PIXEL_WIDTH: usize = 2;
+enum TerminalScreenAction {
+    KILL(u8),
+    PRINT(u8),
+    SETPIXEL(u8),
+}
 
 pub struct TerminalScreen {
     pixel_front_buffer: Vec<Vec<String>>,
@@ -146,7 +150,6 @@ pub struct TerminalScreen {
     pub stdout: RawTerminal<Stdout>,
     key_actions: HashMap<Key, Arc<dyn Fn() + Send + Sync>>,
     run_actions: HashMap<(bool, u8), Arc<dyn Fn() + Send + Sync>>,
-    queued_actions: Arc<Vec<Arc<dyn Fn() + Send + Sync + DerefMut>>>,
 }
 
 impl TerminalScreen {
@@ -184,7 +187,6 @@ impl TerminalScreen {
             stdout: stdout().into_raw_mode().unwrap(),
             key_actions: HashMap::new(),
             run_actions: HashMap::new(),
-            queued_actions: Arc::new(Vec::new()),
         }
     }
 
@@ -235,6 +237,7 @@ pub trait TerminalScreenTrait {
 
 impl TerminalScreenTrait for TerminalScreen {
     unsafe fn run(mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
         write!(
             self.stdout,
             r#"{}{}{}"#,
@@ -244,27 +247,24 @@ impl TerminalScreenTrait for TerminalScreen {
         )
         .unwrap();
         self.stdout.flush().unwrap();
-        let queued_actions = Arc::clone(&self.queued_actions);
         thread::spawn(move || {
-            let key_actions = self.key_actions.clone();
-            let run_actions = self.run_actions.clone();
             for c in self.stdin.keys() {
-                // i reckon this speaks for itself
                 if let Ok(key) = c {
-                    if let Some(action) = key_actions.get(&key) {
-                        (*queued_actions).push(action.clone());
+                    if let Some(action) = self.key_actions.get(&key) {
+                        // self.queued_actions.lock().unwrap().push(action.clone());
+                        tx.send(action.clone()).unwrap();
                     }
                 }
 
-                for (enabled, action) in run_actions.iter() {
+                for (enabled, action) in self.run_actions.iter() {
                     if enabled.0 == true {
-                        (*queued_actions).push(action.clone());
+                        // self.queued_actions.lock().unwrap().push(action.clone());
+                        tx.send(action.clone()).unwrap();
                     };
                 }
             }
         });
 
-        //detecting keydown events
         loop {
             //clearing the screen and going to top left corner
             write!(
@@ -275,12 +275,8 @@ impl TerminalScreenTrait for TerminalScreen {
             )
             .unwrap();
 
-            for action in self.queued_actions.iter() {
-                action();
-            }
-
             self.pixel_front_buffer = self.pixel_back_buffer.clone();
-            //write!(self.stdout, "{}x{}", self.dimensions.0, self.dimensions.1).unwrap();
+            write!(self.stdout, "{}x{}", self.dimensions.0, self.dimensions.1).unwrap();
             for y in 0..self.dimensions.1 {
                 let yu16: u16 = (y + 1).try_into().unwrap();
                 for x in 0..self.dimensions.0 {
@@ -293,6 +289,12 @@ impl TerminalScreenTrait for TerminalScreen {
                     )
                     .unwrap();
                 }
+            }
+
+            match rx.try_recv() {
+                Ok(resp) => resp(),
+                Err(TryRecvError::Disconnected) => panic!("Disconnected!"),
+                Err(TryRecvError::Empty) => (),
             }
 
             for y in 0..self.dimensions.1 {
@@ -311,7 +313,7 @@ impl TerminalScreenTrait for TerminalScreen {
             }
 
             self.stdout.flush().unwrap();
-            thread::sleep(Duration::from_secs_f32(1.0 / 60.0));
+            thread::sleep(Duration::from_secs_f32(1.0 / SCREEN_REFRESH_RATE));
         }
     }
 
