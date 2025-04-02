@@ -23,8 +23,8 @@ pub enum ActionType {
 
 pub enum TerminalScreenAction {
     EXIT(i32),
-    SETPIXEL((usize, usize, char)),
-    PRINT((u16, u16, Vec<char>)),
+    SETPIXELCHAR((usize, usize, char)),
+    PRINT((u16, u16, char)),
 }
 
 pub struct TerminalScreen {
@@ -34,7 +34,7 @@ pub struct TerminalScreen {
     pub startmessage: String,
     pub stdin: Stdin,
     pub stdout: RawTerminal<Stdout>,
-    pub actions: HashMap<u8, (ActionType, TerminalScreenAction)>,
+    pub actions: ActionManager,
 }
 
 impl TerminalScreen {
@@ -58,11 +58,16 @@ impl TerminalScreen {
         };
 
         let pixel_buffer = vec![vec![SCREEN_BLANK_CHAR; dimensions.0]; dimensions.1];
-        let mut actions = HashMap::new();
-        actions.insert(
-            0,
-            (ActionType::KEY(Key::Esc), TerminalScreenAction::EXIT(0)),
-        );
+        let mut actions = ActionManager::new();
+        actions.push((ActionType::KEY(Key::Esc), TerminalScreenAction::EXIT(0)));
+        actions.push((
+            ActionType::KEY(Key::Char('w')),
+            TerminalScreenAction::SETPIXELCHAR((2, 2, 'D')),
+        ));
+        actions.push((
+            ActionType::KEY(Key::Char('e')),
+            TerminalScreenAction::PRINT((20, 20, 'F')),
+        ));
 
         Self {
             pixel_front_buffer: pixel_buffer.clone(),
@@ -82,7 +87,8 @@ pub trait TerminalScreenTrait {
 
 impl TerminalScreenTrait for TerminalScreen {
     unsafe fn run(mut self) {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel::<Arc<dyn Fn() + Send + Sync>>();
+        let (pixel_tx, pixel_rx) = std::sync::mpsc::channel::<(usize, usize, char)>();
         write!(
             self.stdout,
             r#"{}{}{}"#,
@@ -95,7 +101,7 @@ impl TerminalScreenTrait for TerminalScreen {
         thread::spawn(move || {
             for c in self.stdin.keys() {
                 // get input keys
-                for action in self.actions.values() {
+                for action in self.actions.iter() {
                     match action.0 {
                         // depends on the action keytypes
                         ActionType::KEY(k) => {
@@ -107,13 +113,14 @@ impl TerminalScreenTrait for TerminalScreen {
                                     match action.1 {
                                         // all the possible actions
                                         TerminalScreenAction::EXIT(code) => process::exit(code),
-                                        TerminalScreenAction::SETPIXEL((x, y, chr)) => tx
-                                            .send(Arc::new(move || print!(r#"{}{}{}"#, x, y, chr)))
-                                            .unwrap(),
+                                        TerminalScreenAction::SETPIXELCHAR((x, y, chr)) => {
+                                            pixel_tx.send((x, y, chr)).unwrap()
+                                        }
                                         TerminalScreenAction::PRINT((x, y, chr)) => tx
-                                            .send(Arc::new(move || print!(r#"{}{}{}"#, x, y, chr)))
+                                            .send(Arc::new(move || {
+                                                print!(r#"{}{}"#, termion::cursor::Goto(x, y), chr)
+                                            }))
                                             .unwrap(),
-
                                         _ => unimplemented!(),
                                     }
                                 }
@@ -122,7 +129,7 @@ impl TerminalScreenTrait for TerminalScreen {
                         ActionType::RUN => match action.1 {
                             // all the possible actions
                             TerminalScreenAction::EXIT(code) => process::exit(code),
-                            TerminalScreenAction::SETPIXEL((x, y, chr)) => (),
+                            TerminalScreenAction::SETPIXELCHAR((x, y, chr)) => (),
                             _ => unimplemented!(),
                         },
                     }
@@ -140,8 +147,6 @@ impl TerminalScreenTrait for TerminalScreen {
             )
             .unwrap();
 
-            self.pixel_front_buffer = self.pixel_back_buffer.clone();
-            write!(self.stdout, "{}x{}", self.dimensions.0, self.dimensions.1).unwrap();
             for y in 0..self.dimensions.1 {
                 let yu16: u16 = (y + 1).try_into().unwrap();
                 for x in 0..self.dimensions.0 {
@@ -162,19 +167,59 @@ impl TerminalScreenTrait for TerminalScreen {
                 Err(TryRecvError::Empty) => (),
             }
 
+            match pixel_rx.try_recv() {
+                Ok(data) => self.pixel_back_buffer[data.1][data.0] = data.2,
+                Err(TryRecvError::Disconnected) => panic!("Disconnected!"),
+                Err(TryRecvError::Empty) => (),
+            }
+
             for y in 0..self.dimensions.1 {
                 for x in 0..self.dimensions.0 {
-                    self.pixel_back_buffer[y][x] =
-                        if self.pixel_back_buffer[y][x] == SCREEN_BLANK_CHAR {
-                            '#'
-                        } else {
-                            SCREEN_BLANK_CHAR
-                        };
+                    if self.pixel_front_buffer[y][x] != self.pixel_back_buffer[y][x] {
+                        self.pixel_front_buffer[y][x] = self.pixel_back_buffer[y][x];
+                    }
                 }
             }
+
+            self.pixel_back_buffer = self.pixel_front_buffer.clone();
 
             self.stdout.flush().unwrap();
             thread::sleep(Duration::from_secs_f32(1.0 / SCREEN_REFRESH_RATE));
         }
+    }
+}
+
+pub struct ActionManager {
+    actions: HashMap<u16, (ActionType, TerminalScreenAction)>,
+}
+
+impl std::ops::Index<&'_ u16> for ActionManager {
+    type Output = (ActionType, TerminalScreenAction);
+
+    fn index(&self, index: &'_ u16) -> &Self::Output {
+        match self.actions.get(index) {
+            Some(action) => action,
+            None => panic!("Action not found at index {}", index),
+        }
+    }
+}
+
+impl ActionManager {
+    pub fn new() -> Self {
+        Self {
+            actions: HashMap::new(),
+        }
+    }
+    pub fn insert(&mut self, data: (u16, (ActionType, TerminalScreenAction))) {
+        self.actions.insert(data.0, data.1);
+    }
+    pub fn push(&mut self, data: (ActionType, TerminalScreenAction)) {
+        let key = self.actions.len() as u16;
+        self.actions.insert(key, data);
+    }
+    pub fn iter(
+        &mut self,
+    ) -> std::collections::hash_map::Values<'_, u16, (ActionType, TerminalScreenAction)> {
+        self.actions.values()
     }
 }
