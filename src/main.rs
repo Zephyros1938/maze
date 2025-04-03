@@ -12,10 +12,8 @@ fn main() {
     let mut screen = terminal_screen::TerminalScreen::new((0, 0));
 
     screen.add_action(terminal_screen::Action {
-        t: ActionType::KEY(termion::event::Key::Char('f')),
-        f: ScreenAction::CUSTOMFN(MClosure::new(|| {
-            1;
-        })),
+        t: ActionType::KEY(termion::event::Key::Esc),
+        f: ScreenAction::EXIT(0),
     });
 
     unsafe { screen.run() };

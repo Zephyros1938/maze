@@ -22,7 +22,7 @@ pub struct MClosure {
     data: Arc<Mutex<Box<dyn FnMut() + Send + 'static>>>,
 }
 impl MClosure {
-    pub fn new(c: impl FnMut() + Send + 'static) -> Self {
+    pub fn new(c: impl Fn() + Send + 'static) -> Self {
         Self {
             data: Arc::new(Mutex::new(Box::new(c))),
         }
@@ -40,7 +40,7 @@ pub enum ScreenAction {
     PRINTC((u16, u16, Vec<char>)),
     PRINT((u16, u16, String)),
     CUSTOMFN_ARC(Arc<dyn Fn() + Send + Sync>),
-    CUSTOMFN(MClosure),
+    // CUSTOMFN(MClosure),
 }
 
 pub struct TerminalScreen {
