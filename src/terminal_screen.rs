@@ -24,7 +24,7 @@ pub enum ActionType {
 pub enum TerminalScreenAction {
     EXIT(i32),
     SETPIXELCHAR((usize, usize, char)),
-    PRINT((u16, u16, char)),
+    PRINT((u16, u16, Vec<char>)),
 }
 
 pub struct TerminalScreen {
@@ -66,7 +66,7 @@ impl TerminalScreen {
         ));
         actions.push((
             ActionType::KEY(Key::Char('e')),
-            TerminalScreenAction::PRINT((20, 20, 'F')),
+            TerminalScreenAction::PRINT((20, 20, vec!['F'])),
         ));
 
         Self {
@@ -89,6 +89,7 @@ impl TerminalScreenTrait for TerminalScreen {
     unsafe fn run(mut self) {
         let (tx, rx) = std::sync::mpsc::channel::<Arc<dyn Fn() + Send + Sync>>();
         let (pixel_tx, pixel_rx) = std::sync::mpsc::channel::<(usize, usize, char)>();
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<(u16, u16, String)>();
         write!(
             self.stdout,
             r#"{}{}{}"#,
@@ -116,10 +117,12 @@ impl TerminalScreenTrait for TerminalScreen {
                                         TerminalScreenAction::SETPIXELCHAR((x, y, chr)) => {
                                             pixel_tx.send((x, y, chr)).unwrap()
                                         }
-                                        TerminalScreenAction::PRINT((x, y, chr)) => tx
-                                            .send(Arc::new(move || {
-                                                print!(r#"{}{}"#, termion::cursor::Goto(x, y), chr)
-                                            }))
+                                        TerminalScreenAction::PRINT((x, y, ref chr)) => write_tx
+                                            .send((
+                                                x,
+                                                y,
+                                                String::from(chr.into_iter().collect::<String>()),
+                                            ))
                                             .unwrap(),
                                         _ => unimplemented!(),
                                     }
@@ -129,7 +132,6 @@ impl TerminalScreenTrait for TerminalScreen {
                         ActionType::RUN => match action.1 {
                             // all the possible actions
                             TerminalScreenAction::EXIT(code) => process::exit(code),
-                            TerminalScreenAction::SETPIXELCHAR((x, y, chr)) => (),
                             _ => unimplemented!(),
                         },
                     }
@@ -169,6 +171,18 @@ impl TerminalScreenTrait for TerminalScreen {
 
             match pixel_rx.try_recv() {
                 Ok(data) => self.pixel_back_buffer[data.1][data.0] = data.2,
+                Err(TryRecvError::Disconnected) => panic!("Disconnected!"),
+                Err(TryRecvError::Empty) => (),
+            }
+
+            match write_rx.try_recv() {
+                Ok(data) => write!(
+                    self.stdout,
+                    r#"{}{}"#,
+                    termion::cursor::Goto(data.0, data.1),
+                    data.2,
+                )
+                .unwrap(),
                 Err(TryRecvError::Disconnected) => panic!("Disconnected!"),
                 Err(TryRecvError::Empty) => (),
             }
