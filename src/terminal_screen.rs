@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
     io::{Stdin, Stdout, Write, stdin, stdout},
-    process,
+    ops::DerefMut,
+    process::{self, Output},
+    rc::Rc,
     sync::{Arc, Mutex, mpsc::TryRecvError},
     thread,
     time::Duration,
@@ -18,11 +20,11 @@ const SCREEN_BLANK_CHAR: char = ' ';
 const SCREEN_PIXEL_WIDTH: usize = 2;
 const SCREEN_REFRESH_RATE: f32 = 15.0;
 
-pub struct MClosure {
-    data: Arc<Mutex<Box<dyn FnMut() + Send + 'static>>>,
+pub struct MClosure<T> {
+    data: Arc<Mutex<Box<T>>>,
 }
-impl MClosure {
-    pub fn new(c: impl Fn() + Send + 'static) -> Self {
+impl<T> MClosure<T> {
+    pub fn new(c: T) -> Self {
         Self {
             data: Arc::new(Mutex::new(Box::new(c))),
         }
@@ -40,7 +42,20 @@ pub enum ScreenAction {
     PRINTC((u16, u16, Vec<char>)),
     PRINT((u16, u16, String)),
     CUSTOMFN_ARC(Arc<dyn Fn() + Send + Sync>),
-    // CUSTOMFN(MClosure),
+
+    FN_SETPIXELCHAR(
+        (
+            Arc<dyn Fn() -> usize + Send + Sync>,
+            Arc<dyn Fn() -> usize + Send + Sync>,
+            Arc<dyn Fn() -> char + Send + Sync>,
+        ),
+    ),
+
+    FN_SA(
+        MClosure<ScreenAction>, /*<dyn FnMut() -> ScreenAction + Send + Sync>*/
+    ),
+
+    FN(Arc<dyn Fn() -> ScreenAction + Send + Sync>),
 }
 
 pub struct TerminalScreen {
@@ -78,15 +93,8 @@ impl TerminalScreen {
 
         let pixel_buffer = vec![vec![SCREEN_BLANK_CHAR; dimensions.0]; dimensions.1];
         let actions = ActionManager::from(vec![
-            Action::new(ActionType::KEY(Key::Ctrl('c')), ScreenAction::EXIT(0)),
-            Action::new(
-                ActionType::KEY(Key::Char('w')),
-                ScreenAction::SETPIXELCHAR((2, 2, 'D')),
-            ),
-            Action::new(
-                ActionType::KEY(Key::Char('e')),
-                ScreenAction::PRINTC((20, 20, vec!['F'])),
-            ),
+            Action::new(ActionType::KEY(Key::Ctrl('c')), ScreenAction::EXIT(130)),
+            Action::new(ActionType::KEY(Key::Esc), ScreenAction::EXIT(0)),
         ]);
 
         Self {
@@ -101,22 +109,20 @@ impl TerminalScreen {
     }
 }
 
-unsafe impl Sync for TerminalScreen {}
-
-pub trait TerminalScreenTrait {
+pub unsafe trait TerminalScreenTrait {
     unsafe fn run(self);
-    fn add_action(&mut self, action: Action);
-    fn do_action(&self, action: ScreenAction);
+    unsafe fn add_action(&mut self, action: Action);
+    unsafe fn do_action(&mut self, action: ScreenAction);
 }
 
-impl TerminalScreenTrait for TerminalScreen {
+unsafe impl TerminalScreenTrait for TerminalScreen {
     unsafe fn run(mut self) {
         let (event_tx, event_rx) = std::sync::mpsc::channel::<Arc<dyn Fn() + Send + Sync>>();
         let (pixel_tx, pixel_rx) = std::sync::mpsc::channel::<(usize, usize, char)>();
         let (write_tx, write_rx) = std::sync::mpsc::channel::<(u16, u16, String)>();
         self.stdout.flush().unwrap();
-        thread::Builder::new()
-            .name(String::from("Key Thread"))
+        let event_thread = thread::Builder::new()
+            .name(String::from("Event Thread"))
             .spawn(move || {
                 for _c in self.stdin.keys() {
                     // get input keys
@@ -135,6 +141,11 @@ impl TerminalScreenTrait for TerminalScreen {
                                             ScreenAction::SETPIXELCHAR((x, y, chr)) => {
                                                 pixel_tx.send((x, y, chr)).unwrap()
                                             }
+                                            ScreenAction::FN_SETPIXELCHAR((
+                                                ref x,
+                                                ref y,
+                                                ref chr,
+                                            )) => pixel_tx.send((x(), y(), chr())).unwrap(),
                                             ScreenAction::PRINTC((x, y, ref chr)) => write_tx
                                                 .send((
                                                     x,
@@ -149,6 +160,23 @@ impl TerminalScreenTrait for TerminalScreen {
                                             }
                                             ScreenAction::CUSTOMFN_ARC(ref f) => {
                                                 event_tx.send(f.to_owned()).unwrap()
+                                            }
+                                            ScreenAction::FN_SA(ref f) => match **f.data.lock().unwrap() {
+                                                ScreenAction::FN_SA(ref _f) => panic!("ScreenAction::FN_SA cannot lead to another ScreenAction::FN_SA!"),
+                                                ScreenAction::FN(ref _f) => panic!("ScreenAction::FN_SA cannot lead to a ScreenAction::FN!"),
+                                                ScreenAction::SETPIXELCHAR((x, y, chr)) => {
+                                                    pixel_tx.send((x, y, chr)).unwrap()
+                                                }
+                                                _ => unimplemented!(),
+                                            },
+                                            ScreenAction::FN(ref f) => match f()
+                                            {
+                                                ScreenAction::FN_SA( _f) => panic!("ScreenAction::FN cannot lead to another ScreenAction::FN!"),
+                                                    ScreenAction::FN( _f) => panic!("ScreenAction::FN cannot lead to a ScreenAction::FN_SA!"),
+                                                    ScreenAction::SETPIXELCHAR(( x, y, chr)) => {
+                                                        pixel_tx.send((x, y, chr)).unwrap()
+                                                    }
+                                                    _ => unimplemented!(),
                                             }
                                             _ => unimplemented!(),
                                         }
@@ -169,7 +197,7 @@ impl TerminalScreenTrait for TerminalScreen {
             //clearing the screen and going to top left corner
             write!(
                 self.stdout,
-                "{:}{:}",
+                r#"{}{}"#,
                 termion::cursor::Goto(1, 1),
                 termion::clear::All
             )
@@ -191,7 +219,7 @@ impl TerminalScreenTrait for TerminalScreen {
 
             match event_rx.try_recv() {
                 Ok(resp) => resp(),
-                Err(TryRecvError::Disconnected) => panic!("rx disconnected!"),
+                Err(TryRecvError::Disconnected) => panic!("event_rx disconnected!"),
                 Err(TryRecvError::Empty) => (),
             }
 
@@ -239,12 +267,12 @@ impl TerminalScreenTrait for TerminalScreen {
         }
     }
 
-    fn add_action(&mut self, action: Action) {
+    unsafe fn add_action(&mut self, action: Action) {
         self.actions.push(action);
     }
 
-    fn do_action(&self, action: ScreenAction) {
-        self.master_channel.0.send(action).unwrap();
+    unsafe fn do_action(&mut self, action: ScreenAction) {
+        (*self).master_channel.0.send(action).unwrap();
     }
 }
 
